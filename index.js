@@ -6,14 +6,17 @@ var redis = require("redis")
   , url = require("url");
 
 /**
- * Expose assign
+ * Expose the strategy
  */
+module.exports = UCB1Strategy;
+
 function UCB1Strategy(options, client) {
   options = options || {};
   client = client || "redis://localhost:6379";
 
   if(typeof client === "string") client = createClient(client);
 
+  this.name = "ucb1";
   this.client = client;
   this.appName = options.appName || "app";
   this.prefix = options.prefix || join("pivot","ucb1",this.appName);
@@ -27,19 +30,22 @@ UCB1Strategy.prototype.create = function(feature, cb) {
     , self = this
     , untested = [];
 
+  debug("creating feature", prefix);
+
   // Store the feature in our features list
-  create.sadd(join(prefix,"features"), name);
+  create.sadd(join(this.prefix,"features"), name);
 
   // TODO don't re-add untested arms
   create.sadd(join(prefix,"untested"), feature.variants.map(function(value, idx) {
     return idx;
   }));
 
-  // Is it wip?
-  create.hset(join(prefix,"config"), "wip", feature.wip ? 1 : 0);
+  create.hset(join(prefix,"config"), "name", name);
 
-  // Set to not release the variant by default
-  create.hsetnx(join(prefix,"config"), "released", 0);
+  // Is it wip?
+  feature.wip ?
+    create.hset(join(prefix,"config"), "wip", 1) :
+    create.hdel(join(prefix,"config"), "wip");
 
   // Setup any new variants
   feature.variants.forEach(function(variant) {
@@ -51,8 +57,10 @@ UCB1Strategy.prototype.create = function(feature, cb) {
   create.set(join(prefix,"arms"), JSON.stringify(feature.variants));
 
   // Exectute the setup
-  create.exec(function(err) {
+  create.exec(function(err, results) {
     if(err) return cb(err);
+
+    debug(results);
 
     // Store it locally for fast access
     self.features[name] = feature;
@@ -67,6 +75,7 @@ UCB1Strategy.prototype.assign = function(user, features, cb) {
     , self = this;
 
   // If the user is already apart of an experiment, don't assign them
+  debug("current features", features);
   if (Object.keys(features).length) return cb(null, features);
 
   // Use it for later
@@ -76,24 +85,31 @@ UCB1Strategy.prototype.assign = function(user, features, cb) {
   // For now, we'll just enable the first feature
   var name = Object.keys(self.features)[0];
 
+  if(!name) return cb(null, features);
+
   var assign = client.multi()
     , prefix = join(prefix,"features",name);
 
-  assign.hmgetall(join(prefix,"config")); // 0
+  assign.hgetall(join(prefix,"config")); // 0
   assign.spop(join(prefix,"untested")); // 1
-  assign.hmgetall(join(prefix,"counts")); // 2
-  assign.hmgetall(join(prefix,"values")); // 3
+  assign.hgetall(join(prefix,"counts")); // 2
+  assign.hgetall(join(prefix,"values")); // 3
 
   assign.exec(function(err, feature) {
     if (err) return cb(err);
 
     // It hasn't been released
-    if (feature[0].wip || !feature[0].released) return cb(null, {});
+    debug("config",feature[0]);
+    if (feature[0].wip || !feature[0].released) {
+      debug(name+" has not been released");
+      return cb(null, {});
+    }
 
     // We've got an untested arm
     var idx;
     if ((idx = feature[1])) {
       features[name] = self.features[name].variants[idx];
+      debug("untested arm", name, features[name]);
       return cb(null, features);
     }
 
@@ -102,13 +118,26 @@ UCB1Strategy.prototype.assign = function(user, features, cb) {
       , values = feature[3]
       , total = sum(counts);
 
+    debug("counts", counts);
+    debug("values", values);
+    debug("total", total);
+
     var ubcValues = self.features[name].variants.map(function(variant) {
-      return values[variant] + Math.sqrt((2 * Math.log(total)) / parseFloat(counts[variant]));
+      debug(values[variant]+" + Math.sqrt( 2 * Math.log( "+total+" ) / "+counts[variant]+" ))");
+      return parseFloat(values[variant]) + Math.sqrt(2 * Math.log(total) / parseFloat(counts[variant]));
     });
 
-    var selectedArm = Math.max.apply(null, ubcValues);
+    debug("ubc values", ubcValues);
 
-    features[name] = self.features[name].variants[selectedArm];
+    var selectedArm = Math.max.apply(null, ubcValues)
+      , selectedIndex = ubcValues.indexOf(selectedArm);
+
+    // We haven't got any data yet so a random guess is as good as any
+    if(!isFinite(selectedArm)) selectedArm = Math.floor(Math.random() * self.features[name].variants.length);
+
+    debug("selected arm", selectedArm, selectedIndex);
+
+    features[name] = self.features[name].variants[selectedIndex];
 
     cb(null, features);
   });
@@ -120,14 +149,38 @@ UCB1Strategy.prototype.install = function(req, res, user, features) {
 
   req.reward = function(reward) {
 
-    var update = self.client.multi();
+    var keys = Object.keys(features)
+      , incrCount = self.client.multi();
 
-    Object.keys(features).forEach(function(name) {
-      update.hincrby(join(prefix,name,counts,features[name]),1); // Increment the count for the arm
-      // TOOD get the new count for the chosen arm
-      // TODO get the value for the arm
-      // TODO set the new value for the arm
-      // new_value = ((n - 1) / float(n)) * value + (1 / float(n)) * reward
+    debug("rewarding arms with "+reward, keys);
+
+    keys.forEach(function(name) {
+      incrCount.hincrby(join(prefix,name,"counts"), features[name], 1); // Increment the count for the arm
+      incrCount.hget(join(prefix,name,"values"), features[name]);
+    });
+
+    incrCount.exec(function(err, results) {
+      var update = self.client.multi();
+
+      debug("incr results", results);
+
+      keys.forEach(function(name, idx) {
+        var count = parseInt(results[2*idx])
+          , value = parseFloat(results[2*idx+1]);
+
+        debug("current settings", name, count, value);
+
+        debug("old value", value);
+
+        value = ((count - 1) / count) * value + (1 / count) * reward;
+        debug("new value", value);
+
+        update.hset(join(prefix,name,"values"), features[name], value);
+      });
+
+      update.exec(function() {
+        if (err) console.error(err);
+      });
     });
   };
 };
@@ -138,7 +191,7 @@ function join() {
 
 function sum(obj) {
   return Object.keys(obj).reduce(function(prev, current, idx) {
-    return prev + current;
+    return parseInt(prev) + parseInt(current);
   });
 };
 
